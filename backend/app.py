@@ -10,8 +10,11 @@ Run with:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import lessons as lessons_mod
@@ -134,3 +137,21 @@ async def ws_train(websocket: WebSocket) -> None:
             await websocket.close()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------- #
+# Static frontend (packaged build only)
+# --------------------------------------------------------------------------- #
+#
+# In development the Vite dev server serves the SPA on :5173 and proxies /api +
+# /ws here, so this directory does not exist and the mount is skipped. When the
+# app is packaged (make package), the built Three.js frontend is copied into
+# `backend/static/` and bundled into the wheel; mounting it here at "/" makes
+# the single uvicorn process serve both the UI and the JSON API on one origin.
+#
+# The mount is registered last, so the explicit /api/* and /ws/* routes above
+# always take precedence over the catch-all static handler.
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static")

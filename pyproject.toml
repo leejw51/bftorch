@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bftorch"
+version = "0.1.0"
+description = "Interactive PyTorch learning sandbox — FastAPI + PyTorch backend, Three.js frontend."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "fastapi",
+    "uvicorn[standard]",
+    "numpy",
+    "pydantic",
+]
+
+[project.scripts]
+program = "program:main"
+
+[tool.setuptools]
+# program.py is a flat module; backend is a package. The built frontend is
+# copied into backend/static/ before `make wheel` and bundled as package data
+# (see package-data below) so the pyapp binary serves the UI without Node.
+py-modules = ["program"]
+packages = ["backend"]
+
+[tool.setuptools.package-data]
+backend = ["static/**/*"]
