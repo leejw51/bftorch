@@ -151,9 +151,16 @@ def _tensor_to_dict(name: str, value) -> dict | None:
     }
 
 
-def _collect_tensors(namespace: dict) -> list:
-    """Scan the namespace for top-level tensors / arrays and serialize them."""
+def _collect_tensors(namespace: dict, last_value: object = None) -> list:
+    """Scan the namespace for top-level tensors / arrays and serialize them.
+
+    If ``last_value`` (the value of a trailing expression) is a tensor / array
+    that isn't already one of the named top-level variables, it is appended
+    under the synthetic name ``out`` — so a bare ``torch.randn(4, 4)`` with no
+    assignment still produces something to render in 3D.
+    """
     tensors = []
+    seen_ids = set()
     for name, value in list(namespace.items()):
         if name.startswith("_"):
             continue
@@ -165,18 +172,33 @@ def _collect_tensors(namespace: dict) -> list:
             entry = None
         if entry is not None:
             tensors.append(entry)
+            seen_ids.add(id(value))
+
+    # Include the trailing expression's value if it's a renderable tensor/array
+    # and wasn't already captured as a named variable (avoids duplicates like
+    # `x = torch.arange(4); x`).
+    if last_value is not None and id(last_value) not in seen_ids:
+        try:
+            entry = _tensor_to_dict("out", last_value)
+        except Exception:
+            entry = None
+        if entry is not None:
+            tensors.append(entry)
+
     return tensors
 
 
-def _exec_snippet(code: str, namespace: dict) -> str:
+def _exec_snippet(code: str, namespace: dict) -> tuple[str, object]:
     """Execute ``code`` in ``namespace``.
 
-    If the last top-level statement is an expression, evaluate it separately and
-    return the (truncated) repr of its value. Otherwise return ''. Raises any
-    exception produced by the user's code (the caller formats the traceback).
+    Returns ``(repr_str, last_value)``. If the last top-level statement is an
+    expression, it is evaluated separately so we can echo its (truncated) repr
+    AND return its value (so a bare ``torch.randn(4, 4)`` still gets visualized,
+    even though it was never bound to a variable). Otherwise returns ``("", None)``.
+    Raises any exception produced by the user's code (the caller formats it).
     """
     if not code.strip():
-        return ""
+        return "", None
 
     # Parse so we can detect a trailing expression to echo its repr.
     parsed = ast.parse(code, mode="exec")
@@ -194,16 +216,16 @@ def _exec_snippet(code: str, namespace: dict) -> str:
         value = eval(compile(expr_module, "<sandbox>", "eval"), namespace)
 
         if value is None:
-            return ""
+            return "", None
         try:
             rendered = repr(value)
         except Exception:
             rendered = f"<unrepresentable {type(value).__name__} object>"
-        return _truncate(rendered, _MAX_REPR_CHARS)
+        return _truncate(rendered, _MAX_REPR_CHARS), value
 
     # No trailing expression: just execute the whole thing.
     exec(compile(parsed, "<sandbox>", "exec"), namespace)
-    return ""
+    return "", None
 
 
 def run_code(code: str, timeout: float = 15.0) -> dict:
@@ -236,17 +258,18 @@ def run_code(code: str, timeout: float = 15.0) -> dict:
     namespace = _build_namespace()
 
     def _worker() -> None:
+        last_value: object = None
         try:
             with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(
                 stderr_buf
             ):
-                out["result_repr"] = _exec_snippet(code, namespace)
+                out["result_repr"], last_value = _exec_snippet(code, namespace)
         except Exception:
             out["error"] = traceback.format_exc()
         finally:
             # Harvest tensors even on error so partial output isn't lost.
             try:
-                out["tensors"] = _collect_tensors(namespace)
+                out["tensors"] = _collect_tensors(namespace, last_value)
             except Exception:
                 out["tensors"] = []
 
