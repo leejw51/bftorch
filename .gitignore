@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PyTorch Sandbox run state
+.run/
+
+# Node / frontend build
+node_modules/
+frontend/dist/
