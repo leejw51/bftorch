@@ -194,11 +194,14 @@ html, body {
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(380px, 460px) 1fr;
+  grid-template-rows: minmax(0, 1fr);
   gap: 0;
 }
 
 .panel {
   position: relative;
+  min-height: 0;
+  height: 100%;
   overflow-y: auto;
   padding: 18px;
   background: var(--panel);
@@ -250,7 +253,9 @@ html, body {
  * ===================================================================== */
 .pane { display: none; }
 .pane.active {
-  display: block;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
   animation: slide-in 0.32s cubic-bezier(0.22, 1, 0.36, 1);
 }
 @keyframes slide-in {
@@ -462,6 +467,13 @@ input[type="range"]::-moz-range-thumb {
 .console .ok, .ok { color: var(--ok); font-weight: 600; }
 .console .err, .err { color: var(--err); }
 .muted { color: var(--muted); }
+
+/* Trainer log fills the remaining height of the pane down to the bottom. */
+.train-log {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: none;
+}
 
 /* ===================================================================== *
  * Notes / callouts
@@ -685,6 +697,10 @@ input[type="range"]::-moz-range-thumb {
   border-radius: 10px;
   background: var(--panel);
   overflow: hidden;
+  flex: 1 1 auto;
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
 }
 .fnref-head {
   display: flex;
@@ -719,7 +735,9 @@ input[type="range"]::-moz-range-thumb {
   letter-spacing: 0.4px;
 }
 .fnref-body {
-  max-height: 260px;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
   padding: 8px 12px 12px;
 }
