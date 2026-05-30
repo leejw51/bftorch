@@ -25,17 +25,40 @@ def free_port() -> int:
 
 
 def main() -> None:
-    host = os.environ.get("BFTORCH_HOST", "127.0.0.1")
+    from backend import netdbg
+
+    # In debug mode bind to 0.0.0.0 so other machines on the LAN can reach the
+    # packaged server (which serves the UI *and* the API on one origin). HTTPS
+    # is opt-in here (BFTORCH_HTTPS=true) rather than on-by-default: the Tauri
+    # webview can't trust a self-signed cert, so the local window stays HTTP
+    # unless you explicitly ask for TLS.
+    debug = netdbg.is_debug()
+    https = netdbg.https_enabled(default=False)
+
+    default_host = netdbg.bind_host(debug)
+    host = os.environ.get("BFTORCH_HOST", default_host)
     port = int(os.environ.get("BFTORCH_PORT") or free_port())
     # Re-export so child workers / reloads (and anyone reading the env) agree.
     os.environ["BFTORCH_HOST"] = host
     os.environ["BFTORCH_PORT"] = str(port)
 
-    ui_url = f"http://{host}:{port}/"
+    ssl_kwargs: dict = {}
+    if https:
+        cert, key = netdbg.ensure_cert()
+        ssl_kwargs = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
+
+    scheme = "https" if https else "http"
+    # The Tauri shell connects its webview to the loopback address regardless of
+    # what uvicorn binds to, so keep ui-url on 127.0.0.1 (0.0.0.0 isn't a valid
+    # connect target on macOS). The scheme must match how uvicorn is serving.
+    ui_url = f"{scheme}://127.0.0.1:{port}/"
     # These lines are a contract with tauri/src/main.rs — keep the prefixes.
     print(f"[bftorch] pid={os.getpid()}", flush=True)
     print(f"[bftorch] port={port}", flush=True)
     print(f"[bftorch] ui-url={ui_url}", flush=True)
+
+    # When reachable from the LAN, tell the user which URL to open elsewhere.
+    netdbg.banner(context="packaged", https=https, debug=debug, be_port=port)
 
     import uvicorn
 
@@ -45,6 +68,7 @@ def main() -> None:
             host=host,
             port=port,
             log_level=os.environ.get("BFTORCH_LOG_LEVEL", "info"),
+            **ssl_kwargs,
         )
     except KeyboardInterrupt:
         print("\n[bftorch] shutting down.", flush=True)

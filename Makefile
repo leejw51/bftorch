@@ -16,6 +16,46 @@ RUN_DIR := .run
 # Tell the Vite dev-server proxy which backend port to target (keeps them in sync).
 export BACKEND_PORT = $(PORT)
 
+# --- Debug / external-access mode (USE_BFTORCH_DEBUG=true) ----------------- #
+# Off by default: both halves bind to loopback only. Turn it on to make the
+# backend (:$(PORT)) and frontend (:5173) reachable from *other computers* on
+# the LAN (binds 0.0.0.0) and — unless BFTORCH_HTTPS=false — serve them over a
+# self-signed HTTPS cert kept in $(RUN_DIR)/tls/. Detection of the LAN IP, the
+# cert, and the "open this elsewhere" banner all live in backend/netdbg.py
+# (stdlib-only, so plain python3 is fine here).
+NETDBG   := python3 -m backend.netdbg
+TLS_DIR  := $(RUN_DIR)/tls
+TLS_CERT := $(TLS_DIR)/cert.pem
+TLS_KEY  := $(TLS_DIR)/key.pem
+
+ifeq ($(USE_BFTORCH_DEBUG),true)
+  BIND_HOST := 0.0.0.0
+  ifeq ($(BFTORCH_HTTPS),false)
+    DEBUG_HTTPS :=
+  else
+    DEBUG_HTTPS := 1
+  endif
+else
+  BIND_HOST := 127.0.0.1
+  DEBUG_HTTPS :=
+endif
+
+ifeq ($(DEBUG_HTTPS),1)
+  UVICORN_TLS := --ssl-certfile $(TLS_CERT) --ssl-keyfile $(TLS_KEY)
+else
+  UVICORN_TLS :=
+endif
+
+# Consumed by frontend/vite.config.ts (it can't see the make conditionals).
+export BFTORCH_DEBUG    := $(if $(filter true,$(USE_BFTORCH_DEBUG)),1,)
+export BFTORCH_HTTPS    := $(DEBUG_HTTPS)
+export BFTORCH_TLS_CERT := $(if $(DEBUG_HTTPS),$(abspath $(TLS_CERT)),)
+export BFTORCH_TLS_KEY  := $(if $(DEBUG_HTTPS),$(abspath $(TLS_KEY)),)
+
+# Flags passed to the netdbg banner across the dev recipes.
+DEBUG_FLAG := $(if $(filter true,$(USE_BFTORCH_DEBUG)),1,0)
+HTTPS_FLAG := $(if $(DEBUG_HTTPS),1,0)
+
 # --- packaging identity --------------------------------------------------- #
 APP_NAME    := bftorch
 PRODUCT     := PyTorch Sandbox
@@ -45,7 +85,7 @@ PYAPP_CACHE := $(HOME)/Library/Application Support/pyapp/$(APP_NAME)
 
 .DEFAULT_GOAL := help
 .PHONY: help install install-backend install-frontend start stop restart test \
-        backend frontend dev build clean distclean \
+        backend frontend dev build clean distclean _tls \
         icon static wheel package package-py package-tauri app run mac-only
 
 help:
@@ -54,19 +94,25 @@ help:
 	@echo "  Dev:"
 	@echo "    make install   - Python venv + backend deps, and frontend npm deps"
 	@echo "    make start     - start backend (:$(PORT)) and frontend (:5173) in the background"
+	@echo "    make run       - run backend + frontend from source in the foreground (no pyapp)"
 	@echo "    make stop      - stop backend and frontend"
 	@echo "    make restart   - stop then start"
 	@echo "    make test      - run backend smoke tests + frontend build"
 	@echo "    make build     - production build of the frontend"
 	@echo "    (make backend / make frontend run a single service in the foreground)"
 	@echo ""
+	@echo "  Expose to other computers on the LAN (testing):"
+	@echo "    USE_BFTORCH_DEBUG=true make start   - bind 0.0.0.0 + self-signed HTTPS,"
+	@echo "                                          prints the URL to open elsewhere"
+	@echo "    (add BFTORCH_HTTPS=false for plain HTTP)"
+	@echo ""
 	@echo "  Package (macOS / Apple Silicon):"
 	@echo "    make package       - build ./$(DMG) (the full native app, ready to ship)"
 	@echo "    make app           - build ./$(APP_BUNDLE) only (no dmg)"
 	@echo "    make package-py    - build only ./$(BINARY)      (pyapp server binary)"
 	@echo "    make package-tauri - build only ./$(TAURI_BIN)   (native window shell)"
-	@echo "    make run           - build the app, then launch ./$(TAURI_BIN)"
 	@echo "    make icon          - regenerate $(TAURI_DIR)/icons/icon.png"
+	@echo "    (build ./$(APP_BUNDLE) with 'make app', then launch it via ./$(TAURI_BIN))"
 	@echo ""
 	@echo "    make clean         - remove venv, node_modules, builds, app artifacts"
 	@echo "    make distclean     - also remove pyapp + Tauri build caches"
@@ -87,14 +133,23 @@ install-frontend:
 	cd frontend && npm install
 
 # --- start / stop (background) ------------------------------------------- #
-start:
+start: _tls
 	@mkdir -p $(RUN_DIR)
-	@echo "▶  starting backend on :$(PORT) ..."
-	@$(UVICORN) backend.app:app --port $(PORT) > $(RUN_DIR)/backend.log 2>&1 & echo $$! > $(RUN_DIR)/backend.pid
-	@echo "▶  starting frontend on :5173 ..."
+	@echo "▶  starting backend on $(BIND_HOST):$(PORT) ..."
+	@$(UVICORN) backend.app:app --host $(BIND_HOST) --port $(PORT) $(UVICORN_TLS) > $(RUN_DIR)/backend.log 2>&1 & echo $$! > $(RUN_DIR)/backend.pid
+	@echo "▶  starting frontend on $(BIND_HOST):5173 ..."
 	@cd frontend && npm run dev > ../$(RUN_DIR)/frontend.log 2>&1 & echo $$! > $(RUN_DIR)/frontend.pid
 	@echo "✅ started — backend :$(PORT), frontend http://localhost:5173"
+	@$(NETDBG) banner --context dev --fe-port 5173 --be-port $(PORT) --https $(HTTPS_FLAG) --debug $(DEBUG_FLAG)
 	@echo "   logs: $(RUN_DIR)/backend.log, $(RUN_DIR)/frontend.log   |   stop: make stop"
+
+# Ensure the self-signed cert/key exist before a dev server starts.
+# No-op unless debug HTTPS is active.
+_tls:
+	@mkdir -p $(RUN_DIR)
+ifeq ($(DEBUG_HTTPS),1)
+	@$(NETDBG) cert $(TLS_CERT) $(TLS_KEY) >/dev/null
+endif
 
 stop:
 	@-[ -f $(RUN_DIR)/backend.pid ]  && kill `cat $(RUN_DIR)/backend.pid`  2>/dev/null || true
@@ -115,14 +170,21 @@ test:
 	@echo "✅ tests passed"
 
 # --- single-service dev helpers (foreground) ------------------------------ #
-backend:
-	$(UVICORN) backend.app:app --reload --port $(PORT)
+backend: _tls
+	@$(NETDBG) banner --context backend --be-port $(PORT) --https $(HTTPS_FLAG) --debug $(DEBUG_FLAG)
+	$(UVICORN) backend.app:app --reload --host $(BIND_HOST) --port $(PORT) $(UVICORN_TLS)
 
-frontend:
+frontend: _tls
+	@$(NETDBG) banner --context frontend --fe-port 5173 --https $(HTTPS_FLAG) --debug $(DEBUG_FLAG)
 	cd frontend && npm run dev
 
 dev:
 	@$(MAKE) -j2 backend frontend
+
+# `make run` runs the dev stack from source (backend + frontend, foreground).
+# It does NOT build/launch the packaged pyapp+Tauri app — use `make app` /
+# `./bftorch-app` for that.
+run: dev
 
 # `build` keeps its original meaning: a production frontend build.
 build: $(FRONTEND_BUILD)
@@ -238,9 +300,6 @@ $(DMG): app
 	@echo ""
 	@echo "✅ built ./$(DMG)"
 	@echo "   open ./$(DMG)  then drag $(APP_BUNDLE) to Applications"
-
-run: app
-	./$(TAURI_BIN)
 
 # ========================================================================== #
 # Clean

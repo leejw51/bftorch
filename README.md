@@ -36,6 +36,22 @@ make frontend     # vite dev server (proxies /api and /ws to the backend)
 
 Other targets: `make build` (production frontend build), `make clean`.
 
+### Test from another computer
+
+By default everything binds to loopback. To reach the sandbox from another
+machine on your LAN (phone, laptop, another desktop):
+
+```bash
+USE_BFTORCH_DEBUG=true make start
+```
+
+This binds both the backend (`:8200`) and frontend (`:5173`) to `0.0.0.0`,
+serves them over a self-signed HTTPS cert (auto-generated into `.run/tls/`),
+and prints the exact URL to open on the other computer, e.g.
+`https://192.168.1.23:5173/`. The browser will warn about the self-signed
+cert once — choose *Advanced → proceed*. Add `BFTORCH_HTTPS=false` for plain
+HTTP instead.
+
 ## Native macOS app
 
 The whole sandbox ships as a single double-clickable macOS app — no Python, Node,

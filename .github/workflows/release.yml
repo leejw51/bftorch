@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (aarch64-apple-darwin)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python build deps
+        run: python -m pip install --upgrade pip build
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # ── Build the bftorch.app bundle ─────────────────────────────────
+      # `make app` runs the full pipeline at the repo root: frontend build
+      # -> wheel -> pyapp server binary (./bftorch) + Tauri window shell
+      # (./bftorch-app) -> assembled bftorch.app bundle.
+      - name: Build app bundle
+        run: make app
+
+      # ── Import codesigning certificate ────────────────────────────────
+      - name: Import codesigning certificate
+        env:
+          P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -e
+
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ]; then
+            echo "::error::MACOS_CERTIFICATE_P12_BASE64 or MACOS_CERTIFICATE_PASSWORD secret is empty"
+            exit 1
+          fi
+
+          # Strip only CR/LF that secret-paste UIs often append. Do NOT strip
+          # other whitespace — a space could be part of the password.
+          P12_PASSWORD="$(printf '%s' "$P12_PASSWORD" | tr -d '\r\n')"
+
+          P12_PATH="$RUNNER_TEMP/cert.p12"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$P12_PATH"
+          P12_SIZE=$(wc -c < "$P12_PATH" | tr -d ' ')
+          echo "Decoded p12: $P12_SIZE bytes"
+          if [ "$P12_SIZE" -lt 200 ]; then
+            echo "::error::Decoded .p12 is suspiciously small — MACOS_CERTIFICATE_P12_BASE64 likely malformed"
+            exit 1
+          fi
+
+          # OpenSSL diagnostic only — non-fatal. macOS runners may ship
+          # LibreSSL (no -legacy flag) or Homebrew OpenSSL 3.x; keychain
+          # p12 exports vary in PBE algorithm. Print both attempts' stderr
+          # so failures are interpretable, then let `security import` —
+          # which is native and doesn't use openssl — be authoritative.
+          echo "=== openssl info ==="
+          which openssl || true
+          openssl version || true
+          echo "P12_PASSWORD length=${#P12_PASSWORD}"
+
+          echo "=== openssl pkcs12 -legacy ==="
+          openssl pkcs12 -in "$P12_PATH" -nokeys -passin "pass:$P12_PASSWORD" -info -legacy 2>&1 | head -10 || true
+          legacy_rc=${PIPESTATUS[0]}
+          echo "exit(legacy)=$legacy_rc"
+
+          echo "=== openssl pkcs12 (default) ==="
+          openssl pkcs12 -in "$P12_PATH" -nokeys -passin "pass:$P12_PASSWORD" -info 2>&1 | head -10 || true
+          default_rc=${PIPESTATUS[0]}
+          echo "exit(default)=$default_rc"
+
+          if [ "$legacy_rc" = "0" ] || [ "$default_rc" = "0" ]; then
+            echo "openssl: at least one mode read the .p12 successfully"
+          else
+            echo "openssl: neither mode read the .p12 — informational only, continuing to security(1)"
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          if ! security import "$P12_PATH" \
+              -k "$KEYCHAIN_PATH" \
+              -P "$P12_PASSWORD" \
+              -T /usr/bin/codesign \
+              -T /usr/bin/security 2>&1; then
+            echo "::error::security import failed. Verify MACOS_CERTIFICATE_PASSWORD matches the .p12 export password and MACOS_CERTIFICATE_P12_BASE64 is the unaltered base64 of the .p12."
+            exit 1
+          fi
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          CERT_INFO=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" || true)
+          if [ -n "$CERT_INFO" ]; then
+            CERT_ID=$(echo "$CERT_INFO" | head -1 | awk -F'"' '{print $2}')
+            echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> $GITHUB_ENV
+            echo "Found certificate: $CERT_ID"
+          else
+            echo "::warning::No Developer ID Application certificate found, using ad-hoc signing"
+            echo "APPLE_SIGNING_IDENTITY=-" >> $GITHUB_ENV
+          fi
+
+      # ── JIT entitlements for the Tauri/wry WKWebView binary ──────────
+      - name: Create entitlements
+        run: |
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.allow-jit bool true" entitlements.plist
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.allow-unsigned-executable-memory bool true" entitlements.plist
+          /usr/libexec/PlistBuddy -c "Add :com.apple.security.cs.disable-library-validation bool true" entitlements.plist
+
+      # ── Codesign the .app bundle (deepest-first) ─────────────────────
+      # codesign requires nested Mach-Os to be signed before the
+      # enclosing bundle, otherwise the outer signature won't seal.
+      # The bundle's main executable (bftorch-app, per CFBundleExecutable)
+      # is the Tauri/wry window shell and gets the JIT entitlements when we
+      # sign the bundle as a whole. bftorch is the pyapp server binary that
+      # rides along beside it.
+      - name: Codesign app bundle
+        run: |
+          set -e
+          APP="bftorch.app"
+
+          echo "[codesign] signing nested pyapp server binary (no entitlements)"
+          codesign --force --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            --timestamp \
+            "$APP/Contents/MacOS/bftorch"
+
+          echo "[codesign] signing bundle (entitlements apply to main executable bftorch-app)"
+          codesign --force --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            --entitlements entitlements.plist \
+            --timestamp \
+            "$APP"
+
+          echo "[codesign] verifying bundle"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -10
+
+      # ── Notarize + staple the .app, then drop into signed DMG ────────
+      # The .app carries the stapled ticket; once stapled, the bundle
+      # validates with Gatekeeper offline even after extraction from
+      # the DMG. The DMG itself only needs to be signed, not notarized.
+      - name: Notarize app and build DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          set -e
+          APP="bftorch.app"
+          ZIP="bftorch.app.zip"
+
+          echo "[notarize] zipping bundle for submission"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+
+          echo "[notarize] submitting to Apple (this can take several minutes)"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait --timeout 20m
+
+          echo "[notarize] stapling ticket to bundle"
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+          echo "[dmg] staging stapled bundle"
+          mkdir -p dist/dmg-staging
+          # ditto preserves the xattrs that hold the stapled ticket
+          ditto "$APP" "dist/dmg-staging/bftorch.app"
+          ln -s /Applications dist/dmg-staging/Applications
+
+          DMG="dist/bftorch-macos-arm64.dmg"
+          echo "[dmg] building $DMG"
+          hdiutil create -volname "PyTorch Sandbox" \
+            -srcfolder dist/dmg-staging \
+            -fs HFS+ -ov -format UDZO \
+            "$DMG"
+
+          echo "[dmg] signing DMG"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" \
+            --timestamp \
+            "$DMG"
+
+          rm -rf dist/dmg-staging "$ZIP"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bftorch-macos-arm64
+          path: dist/bftorch-macos-arm64.dmg
+
+      # ── Cleanup keychain ─────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bftorch-macos-arm64
+          path: release
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/*
